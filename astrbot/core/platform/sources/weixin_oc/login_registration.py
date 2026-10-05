@@ -68,12 +68,14 @@ def _client(
     adapter_id: str,
     base_url: str,
     api_timeout_ms: int,
+    proxy_url: str | None = None,
 ) -> WeixinOCClient:
     return WeixinOCClient(
         adapter_id=adapter_id,
         base_url=base_url,
         cdn_base_url=DEFAULT_WEIXIN_OC_CDN_BASE_URL,
         api_timeout_ms=api_timeout_ms,
+        proxy_url=proxy_url,
     )
 
 
@@ -101,6 +103,7 @@ async def request_weixin_oc_login_qr(
         adapter_id=str(platform_config.get("id") or "weixin_oc"),
         base_url=base_url,
         api_timeout_ms=api_timeout_ms,
+        proxy_url=_string_field(platform_config, "weixin_oc_proxy_url") or None,
     )
     try:
         data = await client.request_json(
@@ -151,6 +154,7 @@ async def poll_weixin_oc_login_once(
         adapter_id=str(platform_config.get("id") or "weixin_oc"),
         base_url=base_url,
         api_timeout_ms=api_timeout_ms,
+        proxy_url=_string_field(platform_config, "weixin_oc_proxy_url") or None,
     )
     try:
         data = await client.request_json(

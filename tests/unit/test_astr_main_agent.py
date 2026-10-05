@@ -1,5 +1,6 @@
 """Tests for astr_main_agent module."""
 
+import asyncio
 import datetime
 import os
 from contextlib import nullcontext
@@ -7,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from astrbot.core import astr_main_agent as ama
@@ -327,12 +329,14 @@ async def test_proactive_agent_respects_runtime_and_safety_settings(
         if entrypoint == "cron":
             manager = CronJobManager(MagicMock())
             manager.ctx = mock_context
-            await manager._woke_main_agent(
-                message="run scheduled task",
-                session_str=mock_event.unified_msg_origin,
-                delivery_session_str=mock_event.unified_msg_origin,
-                extras={"cron_job": {"id": "job-1"}, "cron_payload": {}},
-            )
+            # This runner produces no message or receipt; delivery must fail closed.
+            with pytest.raises(RuntimeError, match="no success receipt"):
+                await manager._woke_main_agent(
+                    message="run scheduled task",
+                    session_str=mock_event.unified_msg_origin,
+                    delivery_session_str=mock_event.unified_msg_origin,
+                    extras={"cron_job": {"id": "job-1"}, "cron_payload": {}},
+                )
         else:
             await FunctionToolExecutor._wake_main_agent_for_background_result(
                 ContextWrapper(
@@ -1727,6 +1731,58 @@ class TestPluginToolFix:
 
 class TestBuildMainAgent:
     """Tests for build_main_agent function."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("quoted", [False, True])
+    @pytest.mark.parametrize("error", [TimeoutError, aiohttp.ClientConnectionError])
+    async def test_unavailable_image_preserves_text(
+        self, mock_event, mock_context, mock_provider, quoted, error
+    ):
+        """Keep textual requests usable without fabricating image contents."""
+        image = Image(file="https://multimedia.nt.qq.com.cn/download?secret=hidden")
+        attachment = Reply(id="quote", chain=[image]) if quoted else image
+        mock_event.message_obj.message = [Plain(text="Hello"), attachment]
+        mock_context.get_using_provider.return_value = mock_provider
+        _setup_conversation_for_build(mock_context.conversation_manager)
+        with (
+            patch("astrbot.core.astr_main_agent.AgentRunner") as runner,
+            patch("astrbot.core.astr_main_agent.AstrAgentContext"),
+            patch.object(Image, "convert_to_file_path", AsyncMock(side_effect=error)),
+        ):
+            runner.return_value.reset = AsyncMock()
+            result = await ama.build_main_agent(
+                event=mock_event,
+                plugin_context=mock_context,
+                config=ama.MainAgentBuildConfig(tool_call_timeout=60),
+                provider=mock_provider,
+            )
+        assert result is not None
+        assert "Hello" in result.provider_request.prompt
+        assert result.provider_request.image_urls == []
+        text = " ".join(
+            p.text for p in result.provider_request.extra_user_content_parts
+        )
+        assert "unavailable" in text
+        assert "Do not infer" in text
+        assert "secret=hidden" not in text
+
+    @pytest.mark.asyncio
+    async def test_image_download_cancellation_propagates(
+        self, mock_event, mock_context, mock_provider
+    ):
+        """A cancelled request must not continue as a degraded text reply."""
+        mock_event.message_obj.message = [Image(file="https://example.com/image")]
+        _setup_conversation_for_build(mock_context.conversation_manager)
+        with patch.object(
+            Image, "convert_to_file_path", AsyncMock(side_effect=asyncio.CancelledError)
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await ama.build_main_agent(
+                    event=mock_event,
+                    plugin_context=mock_context,
+                    config=ama.MainAgentBuildConfig(tool_call_timeout=60),
+                    provider=mock_provider,
+                )
 
     @pytest.mark.asyncio
     async def test_build_main_agent_basic(

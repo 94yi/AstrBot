@@ -1459,7 +1459,9 @@ async def collect_initial_request(
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
                     try:
-                        image_path = await comp.convert_to_file_path()
+                        image_path = await asyncio.wait_for(
+                            comp.convert_to_file_path(), timeout=8
+                        )
                     except Exception as exc:
                         if not is_recoverable_image_error(exc):
                             raise
@@ -1467,7 +1469,9 @@ async def collect_initial_request(
                             "Image attachment is unavailable (%s).", type(exc).__name__
                         )
                         req.extra_user_content_parts.append(
-                            TextPart(text="[Image unavailable]")
+                            TextPart(
+                                text="[Image unavailable: download failed. Do not infer its contents.]"
+                            )
                         )
                         continue
                     req.image_urls.append(image_path)
@@ -1513,7 +1517,9 @@ async def collect_initial_request(
                         if isinstance(reply_comp, Image):
                             has_embedded_image = True
                             try:
-                                image_path = await reply_comp.convert_to_file_path()
+                                image_path = await asyncio.wait_for(
+                                    reply_comp.convert_to_file_path(), timeout=8
+                                )
                             except Exception as exc:
                                 if not is_recoverable_image_error(exc):
                                     raise
@@ -1522,7 +1528,9 @@ async def collect_initial_request(
                                     type(exc).__name__,
                                 )
                                 req.extra_user_content_parts.append(
-                                    TextPart(text="[Image unavailable]")
+                                    TextPart(
+                                        text="[Image unavailable: download failed. Do not infer its contents.]"
+                                    )
                                 )
                                 continue
                             req.image_urls.append(image_path)
