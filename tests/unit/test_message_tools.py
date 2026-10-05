@@ -148,6 +148,10 @@ async def test_send_message_defaults_to_current_session():
     target_session = call_args[0][0]
     assert str(target_session) == "feishu:GroupMessage:oc_xxx"
     assert ctx.context.event._has_send_oper is True
+    assert ctx.context.event.get_extra("_send_message_to_user_attempted") is True
+    assert (
+        ctx.context.event.get_extra("_send_message_to_user_delivery_succeeded") is True
+    )
     assert ctx.context.event.get_extra(
         "_send_message_to_user_current_session_plain_texts",
     ) == ["hello"]
@@ -172,6 +176,10 @@ async def test_send_message_returns_platform_error_to_tool_result():
         "qq_official:GroupMessage:group-1: 413 Request Entity Too Large"
     )
     assert ctx.context.event._has_send_oper is False
+    assert ctx.context.event.get_extra("_send_message_to_user_attempted") is True
+    assert not ctx.context.event.get_extra(
+        "_send_message_to_user_delivery_succeeded", False
+    )
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 """Tests for CronJobManager."""
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,9 @@ import pytest
 from astrbot.core.cron.manager import (
     CronJobManager,
     CronJobSchedulingError,
+    _holiday_period_for_date,
     _normalize_crontab_day_of_week,
+    _render_structured_daily_schedule,
 )
 from astrbot.core.db.po import CronJob
 
@@ -547,6 +549,48 @@ class TestRunJob:
         # Should not update status
         mock_db.update_cron_job.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_failed_run_once_job_is_retained(self, cron_manager, mock_db):
+        """A failed one-shot stays inspectable and is never blindly retried."""
+        job = CronJob(
+            job_id="one-shot",
+            name="Reminder",
+            job_type="active_agent",
+            enabled=True,
+            run_once=True,
+            payload={"run_at": "2026-09-17T10:25:00+08:00"},
+        )
+        mock_db.get_cron_job.return_value = job
+        cron_manager._run_active_agent_job = AsyncMock(
+            side_effect=RuntimeError("Scheduled message delivery failed")
+        )
+
+        await cron_manager._run_job(job.job_id)
+
+        final_update = mock_db.update_cron_job.await_args_list[-1]
+        assert final_update.kwargs["status"] == "failed"
+        assert final_update.kwargs["enabled"] is False
+        assert "delivery failed" in final_update.kwargs["last_error"]
+        mock_db.delete_cron_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_successful_run_once_job_is_deleted(self, cron_manager, mock_db):
+        """A successful one-shot keeps the consume-on-success behavior."""
+        job = CronJob(
+            job_id="one-shot",
+            name="Reminder",
+            job_type="active_agent",
+            enabled=True,
+            run_once=True,
+            payload={"run_at": "2026-09-17T10:25:00+08:00"},
+        )
+        mock_db.get_cron_job.return_value = job
+        cron_manager._run_active_agent_job = AsyncMock()
+
+        await cron_manager._run_job(job.job_id)
+
+        mock_db.delete_cron_job.assert_awaited_once_with(job.job_id)
+
 
 class TestRunBasicJob:
     """Tests for _run_basic_job method."""
@@ -584,6 +628,187 @@ class TestRunBasicJob:
 
 class TestRunActiveAgentJob:
     """Tests for active agent cron job execution."""
+
+    @staticmethod
+    def schedule():
+        return {
+            "anchor_monday": "2026-09-14",
+            "anchor_week": 3,
+            "active_week_start": 3,
+            "active_week_end": 18,
+            "weekdays": {
+                "3": [
+                    {
+                        "time": "09:50–11:25",
+                        "course": "Web 开发技术基础",
+                        "location": "智慧教学楼 406",
+                    }
+                ],
+                "4": [
+                    {
+                        "time": "09:50–11:25",
+                        "course": "Python 程序设计",
+                        "location": "智慧教学楼 405",
+                    }
+                ],
+            },
+            "notice": "请留意教学云平台通知。",
+            "closing": "祝你上课顺利～ (•‿•)",
+        }
+
+    def test_structured_schedule_converts_utc_to_local_weekday(self):
+        content = _render_structured_daily_schedule(
+            self.schedule(),
+            datetime(2026, 9, 17, 23, 30, tzinfo=timezone.utc),
+            "Asia/Shanghai",
+        )
+        assert "第 3 周周五" in content
+        assert "Python 程序设计" in content
+        assert "Web 开发技术基础" not in content
+
+    def test_structured_schedule_skips_inactive_weeks(self):
+        content = _render_structured_daily_schedule(
+            self.schedule(),
+            datetime(2026, 9, 11, 23, 30, tzinfo=timezone.utc),
+            "Asia/Shanghai",
+        )
+        assert content is None
+
+    def test_holiday_policy_skips_courses_and_allows_confirmed_override(self):
+        policy = {
+            "periods": [
+                {"name": "中秋节", "start": "2026-09-25", "end": "2026-09-27"}
+            ],
+            "class_dates": [],
+        }
+        holiday = _holiday_period_for_date(policy, date(2026, 9, 25))
+        assert holiday is not None
+        assert holiday["name"] == "中秋节"
+        policy["class_dates"] = ["2026-09-25"]
+        assert _holiday_period_for_date(policy, date(2026, 9, 25)) is None
+
+    def test_structured_schedule_asks_on_day_before_holiday(self):
+        policy = {
+            "periods": [
+                {"name": "中秋节", "start": "2026-09-25", "end": "2026-09-27"}
+            ],
+            "class_dates": [],
+        }
+        content = _render_structured_daily_schedule(
+            self.schedule(),
+            datetime(2026, 9, 23, 23, 30, tzinfo=timezone.utc),
+            "Asia/Shanghai",
+            policy,
+        )
+        assert content is not None
+        assert "明天起是中秋节假期" in content
+        assert "有调课或补课吗" in content
+
+    def test_structured_schedule_is_silent_on_holiday(self):
+        policy = {
+            "periods": [
+                {"name": "中秋节", "start": "2026-09-25", "end": "2026-09-27"}
+            ]
+        }
+        content = _render_structured_daily_schedule(
+            self.schedule(),
+            datetime(2026, 9, 24, 23, 30, tzinfo=timezone.utc),
+            "Asia/Shanghai",
+            policy,
+        )
+        assert content is None
+
+    @pytest.mark.asyncio
+    async def test_holiday_guard_stops_agent_course_reminder(self, cron_manager):
+        cron_manager.ctx = MagicMock()
+        cron_manager._woke_main_agent = AsyncMock()
+        job = CronJob(
+            job_id="course-reminder",
+            name="Course reminder",
+            job_type="active_agent",
+            cron_expression="35 9 * * fri",
+            timezone="Asia/Shanghai",
+            payload={
+                "session": "test:FriendMessage:user123",
+                "note": "15分钟后上课",
+                "course_holiday_policy": {
+                    "periods": [
+                        {
+                            "name": "中秋节",
+                            "start": "2026-09-25",
+                            "end": "2026-09-27",
+                        }
+                    ]
+                },
+            },
+            enabled=True,
+            persistent=True,
+            run_once=False,
+            status="scheduled",
+        )
+
+        await cron_manager._run_active_agent_job(
+            job, datetime(2026, 9, 25, 1, 35, tzinfo=timezone.utc)
+        )
+
+        cron_manager._woke_main_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_structured_schedule_sends_directly_without_agent_history(
+        self, cron_manager
+    ):
+        ctx = MagicMock()
+        ctx.send_message = AsyncMock(return_value=True)
+        cron_manager.ctx = ctx
+        job = CronJob(
+            job_id="schedule-job",
+            name="Daily schedule",
+            job_type="active_agent",
+            cron_expression="30 7 * * *",
+            timezone="Asia/Shanghai",
+            payload={
+                "session": "test:FriendMessage:user123",
+                "structured_daily_schedule": self.schedule(),
+            },
+            enabled=True,
+            persistent=True,
+            run_once=False,
+            status="scheduled",
+        )
+        cron_manager._woke_main_agent = AsyncMock()
+        await cron_manager._run_active_agent_job(
+            job, datetime(2026, 9, 17, 23, 30, tzinfo=timezone.utc)
+        )
+        cron_manager._woke_main_agent.assert_not_awaited()
+        ctx.send_message.assert_awaited_once()
+        text = ctx.send_message.await_args.args[1].get_plain_text()
+        assert "第 3 周周五" in text
+        assert "Python 程序设计" in text
+
+    @pytest.mark.asyncio
+    async def test_structured_schedule_failed_transport_fails_job(self, cron_manager):
+        ctx = MagicMock()
+        ctx.send_message = AsyncMock(return_value=False)
+        cron_manager.ctx = ctx
+        job = CronJob(
+            job_id="schedule-job",
+            name="Daily schedule",
+            job_type="active_agent",
+            cron_expression="30 7 * * *",
+            timezone="Asia/Shanghai",
+            payload={
+                "session": "test:FriendMessage:user123",
+                "structured_daily_schedule": self.schedule(),
+            },
+            enabled=True,
+            persistent=True,
+            run_once=False,
+            status="scheduled",
+        )
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            await cron_manager._run_active_agent_job(
+                job, datetime(2026, 9, 17, 23, 30, tzinfo=timezone.utc)
+            )
 
     @pytest.mark.asyncio
     async def test_woke_main_agent_passes_history_and_provider_settings(
@@ -660,6 +885,67 @@ class TestRunActiveAgentJob:
         assert "old question" not in request.system_prompt
         assert "old answer" not in request.system_prompt
         assert request.contexts == history
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("event_state", "raises"),
+        [
+            ({"_send_message_to_user_attempted": True}, True),
+            ({}, True),
+            ({"_send_message_to_user_delivery_succeeded": True}, False),
+            ({"_cron_delivery_skipped": True}, False),
+        ],
+    )
+    async def test_woke_main_agent_requires_receipt_or_explicit_skip(
+        self, cron_manager, event_state, raises
+    ):
+        """Agent prose cannot turn a failed or omitted delivery into success."""
+        ctx = MagicMock()
+        ctx.get_config.return_value = {"admins_id": [], "provider_settings": {}}
+        cron_manager.ctx = ctx
+        conv = MagicMock(history="[]")
+
+        class FakeRunner:
+            def step_until_done(self, _max_step):
+                async def gen():
+                    if False:
+                        yield None
+
+                return gen()
+
+            def get_final_llm_resp(self):
+                response = MagicMock()
+                response.role = "assistant"
+                response.completion_text = "done"
+                return response
+
+        async def fake_build_main_agent(*, event, **_kwargs):
+            for key, value in event_state.items():
+                event.set_extra(key, value)
+            return MagicMock(agent_runner=FakeRunner())
+
+        with (
+            patch(
+                "astrbot.core.astr_main_agent._get_session_conv",
+                AsyncMock(return_value=conv),
+            ),
+            patch(
+                "astrbot.core.astr_main_agent.build_main_agent",
+                side_effect=fake_build_main_agent,
+            ),
+            patch("astrbot.core.cron.manager.persist_agent_history", AsyncMock()),
+        ):
+            invocation = cron_manager._woke_main_agent(
+                message="remind",
+                session_str="test:FriendMessage:user123",
+                extras={"cron_job": {"id": "job-1"}, "cron_payload": {}},
+                delivery_session_str="test:FriendMessage:user123",
+            )
+            if raises:
+                with pytest.raises(RuntimeError, match="no success receipt"):
+                    await invocation
+            else:
+                await invocation
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

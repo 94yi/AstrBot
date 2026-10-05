@@ -11,6 +11,8 @@ from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiohttp
+
 from astrbot.core import logger
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.mcp_client import MCPTool
@@ -935,7 +937,9 @@ async def _process_quote_message(
                     )
 
                 if prov and isinstance(prov, Provider):
-                    path = await image_seg.convert_to_file_path()
+                    path = await asyncio.wait_for(
+                        image_seg.convert_to_file_path(), timeout=8
+                    )
                     compress_path = await _compress_image_for_provider(
                         path,
                         config.provider_settings if config else None,
@@ -1462,7 +1466,28 @@ async def build_main_agent(
             # media files attachments
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
-                    path = await comp.convert_to_file_path()
+                    try:
+                        path = await asyncio.wait_for(
+                            comp.convert_to_file_path(), timeout=8
+                        )
+                    except (
+                        aiohttp.ClientError,
+                        TimeoutError,
+                        OSError,
+                        ValueError,
+                    ) as exc:
+                        logger.warning(
+                            "Inbound image unavailable: %s", type(exc).__name__
+                        )
+                        req.extra_user_content_parts.append(
+                            TextPart(
+                                text=(
+                                    "[Image unavailable: download failed. Do not infer its contents; "
+                                    "answer the available text and explain the missing image if needed.]"
+                                )
+                            )
+                        )
+                        continue
                     image_path = await _compress_image_for_provider(
                         path,
                         config.provider_settings,
@@ -1501,7 +1526,28 @@ async def build_main_agent(
                     for reply_comp in comp.chain:
                         if isinstance(reply_comp, Image):
                             has_embedded_image = True
-                            path = await reply_comp.convert_to_file_path()
+                            try:
+                                path = await asyncio.wait_for(
+                                    reply_comp.convert_to_file_path(), timeout=8
+                                )
+                            except (
+                                aiohttp.ClientError,
+                                TimeoutError,
+                                OSError,
+                                ValueError,
+                            ) as exc:
+                                logger.warning(
+                                    "Quoted image unavailable: %s", type(exc).__name__
+                                )
+                                req.extra_user_content_parts.append(
+                                    TextPart(
+                                        text=(
+                                            "[Quoted image unavailable: download failed. "
+                                            "Do not infer its contents.]"
+                                        )
+                                    )
+                                )
+                                continue
                             image_path = await _compress_image_for_provider(
                                 path,
                                 config.provider_settings,

@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ from astrbot.core.agent.tool import ToolSet
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.db import BaseDatabase
 from astrbot.core.db.po import CronJob
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.provider.entites import ProviderRequest
@@ -27,6 +28,139 @@ if TYPE_CHECKING:
 
 _CRONTAB_WEEKDAY_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
 _CRONTAB_WEEKDAY_PATTERN = re.compile(r"^(?:(\*)|(\d+)(?:-(\d+))?)(?:/(\d+))?$")
+_CHINESE_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _holiday_period_for_date(
+    policy: dict[str, Any] | None, target_date: date
+) -> dict[str, Any] | None:
+    """Return the configured holiday period containing one local date.
+
+    Args:
+        policy: Course holiday policy stored in the cron payload
+        target_date: Local calendar date to check
+
+    Returns:
+        The matching normalized period, or ``None`` when classes are allowed
+
+    Raises:
+        ValueError: If the persisted holiday policy is malformed
+    """
+    if policy is None:
+        return None
+    if not isinstance(policy, dict):
+        raise ValueError("course_holiday_policy must be an object")
+    raw_periods = policy.get("periods", [])
+    raw_class_dates = policy.get("class_dates", [])
+    if not isinstance(raw_periods, list) or len(raw_periods) > 64:
+        raise ValueError("invalid course holiday periods")
+    if not isinstance(raw_class_dates, list) or len(raw_class_dates) > 128:
+        raise ValueError("invalid course holiday class dates")
+    try:
+        class_dates = {date.fromisoformat(str(value)) for value in raw_class_dates}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid course holiday class date") from exc
+    if target_date in class_dates:
+        return None
+    for raw_period in raw_periods:
+        if not isinstance(raw_period, dict):
+            raise ValueError("invalid course holiday period")
+        try:
+            start = date.fromisoformat(str(raw_period["start"]))
+            end = date.fromisoformat(str(raw_period["end"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid course holiday period dates") from exc
+        name = str(raw_period.get("name") or "假期").strip()
+        if end < start or not name or len(name) > 80 or "\n" in name:
+            raise ValueError("invalid course holiday period values")
+        if start <= target_date <= end:
+            return {"name": name, "start": start, "end": end}
+    return None
+
+
+def _render_structured_daily_schedule(
+    schedule: dict[str, Any],
+    run_started_at: datetime,
+    timezone_name: str,
+    holiday_policy: dict[str, Any] | None = None,
+) -> str | None:
+    """Render a bounded daily schedule without involving an LLM or chat history.
+
+    Args:
+        schedule: Validated weekly course schedule
+        run_started_at: UTC or timezone-aware scheduler execution time
+        timezone_name: IANA timezone used to select the local day
+        holiday_policy: Optional holiday periods and confirmed class-date overrides
+
+    Returns:
+        Direct-send course text, or ``None`` when no reminder should be sent
+
+    Raises:
+        ValueError: If schedule or holiday metadata is malformed
+    """
+    if not isinstance(schedule, dict):
+        raise ValueError("structured_daily_schedule must be an object")
+    try:
+        tzinfo = ZoneInfo(timezone_name)
+        anchor = date.fromisoformat(str(schedule["anchor_monday"]))
+        anchor_week = int(schedule["anchor_week"])
+        first_week = int(schedule["active_week_start"])
+        last_week = int(schedule["active_week_end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid structured daily schedule metadata") from exc
+    if anchor.weekday() != 0 or not 1 <= anchor_week <= first_week <= last_week <= 60:
+        raise ValueError("invalid structured daily schedule week range")
+    current = run_started_at
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local_date = current.astimezone(tzinfo).date()
+    if _holiday_period_for_date(holiday_policy, local_date):
+        return None
+    local_monday = local_date - timedelta(days=local_date.weekday())
+    week = anchor_week + (local_monday - anchor).days // 7
+    if not first_week <= week <= last_week:
+        return None
+    weekdays = schedule.get("weekdays")
+    if not isinstance(weekdays, dict):
+        raise ValueError("structured daily schedule weekdays must be an object")
+    raw_lessons = weekdays.get(str(local_date.weekday()), [])
+    if not isinstance(raw_lessons, list) or len(raw_lessons) > 20:
+        raise ValueError("invalid structured daily schedule lessons")
+    lessons = []
+    for raw in raw_lessons:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid structured daily schedule lesson")
+        values = tuple(
+            str(raw.get(key) or "").strip() for key in ("time", "course", "location")
+        )
+        if any(not value or len(value) > 120 or "\n" in value for value in values):
+            raise ValueError("invalid structured daily schedule lesson fields")
+        lessons.append("｜".join(values))
+    heading = f"今天是第 {week} 周{_CHINESE_WEEKDAYS[local_date.weekday()]}，课程提醒："
+    if lessons:
+        parts = [heading, *lessons]
+    else:
+        parts = [
+            f"今天是第 {week} 周{_CHINESE_WEEKDAYS[local_date.weekday()]}，今天没有常规课。"
+        ]
+    notice = str(schedule.get("notice") or "").strip()
+    closing = str(schedule.get("closing") or "").strip()
+    tomorrow = local_date + timedelta(days=1)
+    tomorrow_holiday = _holiday_period_for_date(holiday_policy, tomorrow)
+    confirmation = ""
+    if tomorrow_holiday and tomorrow_holiday["start"] == tomorrow:
+        confirmation = (
+            f"明天起是{tomorrow_holiday['name']}假期，常规课程提醒会默认暂停，"
+            "有调课或补课吗？把课程、日期、时间和地点告诉我就好"
+        )
+    for value in (notice, confirmation, closing):
+        if len(value) > 500:
+            raise ValueError("structured daily schedule text is too long")
+        if value:
+            parts.append(value)
+    return "\n\n".join(
+        ["\n".join(parts[: 1 + len(lessons)]), *parts[1 + len(lessons) :]]
+    )
 
 
 def _normalize_crontab_day_of_week(day_of_week: str) -> str:
@@ -337,15 +471,19 @@ class CronJobManager:
             logger.error(f"Cron job {job_id} failed: {e!s}", exc_info=True)
         finally:
             next_run = self._get_next_run_time(job_id)
-            await self.db.update_cron_job(
-                job_id,
-                status=status,
-                last_run_at=start_time,
-                last_error=last_error,
-                next_run_time=next_run,
-            )
-            if job.run_once and delete_run_once:
-                # one-shot: remove after execution regardless of success
+            update_fields = {
+                "status": status,
+                "last_run_at": start_time,
+                "last_error": last_error,
+                "next_run_time": next_run,
+            }
+            if job.run_once and status == "failed":
+                update_fields["enabled"] = False
+            await self.db.update_cron_job(job_id, **update_fields)
+            if job.run_once and delete_run_once and status == "completed":
+                # Keep failed one-shot jobs for explicit inspection/retry.
+                # Automatic retries are unsafe when a transport timeout may
+                # mean that the remote platform accepted the message.
                 await self.delete_job(job_id)
 
     async def _run_basic_job(self, job: CronJob) -> None:
@@ -360,6 +498,54 @@ class CronJobManager:
     async def _run_active_agent_job(self, job: CronJob, start_time: datetime) -> None:
         payload = job.payload or {}
         delivery_session_str = str(payload.get("session") or "").strip()
+        holiday_policy = payload.get("course_holiday_policy")
+        if holiday_policy is not None:
+            timezone_name = job.timezone or str(
+                holiday_policy.get("timezone") or "UTC"
+            )
+            try:
+                tzinfo = ZoneInfo(timezone_name)
+            except Exception as exc:
+                raise ValueError("invalid course holiday timezone") from exc
+            current = start_time
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            local_date = current.astimezone(tzinfo).date()
+            holiday = _holiday_period_for_date(holiday_policy, local_date)
+            if holiday:
+                logger.info(
+                    "Course reminder %s skipped for %s holiday %s",
+                    job.job_id,
+                    holiday["name"],
+                    local_date.isoformat(),
+                )
+                return
+        structured_schedule = payload.get("structured_daily_schedule")
+        if structured_schedule is not None:
+            if not delivery_session_str:
+                raise ValueError("structured schedule requires a delivery session")
+            content = _render_structured_daily_schedule(
+                structured_schedule,
+                start_time,
+                job.timezone or str(structured_schedule.get("timezone") or "UTC"),
+                holiday_policy,
+            )
+            if content is None:
+                logger.info(
+                    "Structured schedule %s is outside its active weeks", job.job_id
+                )
+                return
+            sent = await self.ctx.send_message(
+                delivery_session_str, MessageChain().message(content)
+            )
+            if not sent:
+                raise RuntimeError("Structured schedule delivery failed")
+            logger.info(
+                "Structured schedule %s delivered for %s",
+                job.job_id,
+                content.split("，", 1)[0],
+            )
+            return
         session_str = delivery_session_str or str(
             MessageSession(
                 platform_name="cron",
@@ -520,6 +706,19 @@ class CronJobManager:
             req=req,
             summary_note=summary_note,
         )
+        if delivery_session_str and not cron_event.get_extra(
+            "_cron_delivery_skipped", False
+        ):
+            if not cron_event.get_extra(
+                "_send_message_to_user_delivery_succeeded", False
+            ):
+                attempted = cron_event.get_extra(
+                    "_send_message_to_user_attempted", False
+                )
+                reason = "failed" if attempted else "was not attempted"
+                raise RuntimeError(
+                    f"Scheduled message delivery {reason}; no success receipt."
+                )
         if not llm_resp:
             logger.warning("Cron job agent got no response")
             return

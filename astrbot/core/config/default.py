@@ -39,6 +39,12 @@ PERSONAL_WECHAT_CONFIG_METADATA = {
         "type": "int",
         "hint": "通用 API 请求超时参数。",
     },
+    "weixin_oc_proxy_url": {
+        "description": "微信专用 HTTP(S) 代理",
+        "type": "string",
+        "hint": "可选，仅个人微信 API 与媒体请求使用，例如 http://127.0.0.1:8080。",
+        "secret": True,
+    },
     "weixin_oc_token": {
         "description": "登录后 token（可留空）",
         "type": "string",
@@ -359,6 +365,7 @@ CONFIG_METADATA_2 = {
                         "weixin_oc_qr_poll_interval": 1,
                         "weixin_oc_long_poll_timeout_ms": 35_000,
                         "weixin_oc_api_timeout_ms": 120_000,
+                        "weixin_oc_proxy_url": "",
                     },
                     "飞书(Lark)": {
                         "id": "lark",

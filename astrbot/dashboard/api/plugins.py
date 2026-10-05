@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hmac
+import json
+import os
 import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, Query, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from astrbot.api.web import PluginRequest, bind_request_context
 from astrbot.core import logger
@@ -1510,3 +1514,50 @@ async def dashboard_plugin_extension_route(
     username: str = Depends(require_dashboard_user),
 ):
     return await _call_plugin_extension(plugin_path, request, username)
+
+
+def _companion_service_authorized(request: Request) -> bool:
+    config_path = os.environ.get("COMPANION_REACTION_BRIDGE_CONFIG", "").strip()
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        config = {}
+    expected = str(config.get("token") or "").strip() if isinstance(config, dict) else ""
+    supplied = str(request.headers.get("X-Companion-Token") or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
+
+
+@legacy_router.post("/api/v1/companion/reaction/analyze")
+async def companion_reaction_analysis_bridge(request: Request):
+    """Narrow service bridge; the plugin handler validates its shared token."""
+    if not _companion_service_authorized(request):
+        return JSONResponse({"success": False, "error": "未授权"}, status_code=401)
+    return await _call_plugin_extension(
+        "api/v1/companion/reaction/analyze",
+        request,
+        "companion-service",
+    )
+
+
+@legacy_router.post("/api/v1/companion/tools/ucloud/query")
+async def companion_ucloud_query_bridge(request: Request):
+    """Forward authenticated read-only UCloud calls to the installed plugin"""
+    if not _companion_service_authorized(request):
+        return JSONResponse({"success": False, "error": "未授权"}, status_code=401)
+    return await _call_plugin_extension(
+        "api/v1/companion/tools/ucloud/query",
+        request,
+        "companion-service",
+    )
+
+
+@legacy_router.post("/api/v1/companion/tools/baidu/query")
+async def companion_baidu_query_bridge(request: Request):
+    """Forward authenticated metadata-only OpenList calls to the installed plugin"""
+    if not _companion_service_authorized(request):
+        return JSONResponse({"success": False, "error": "未授权"}, status_code=401)
+    return await _call_plugin_extension(
+        "api/v1/companion/tools/baidu/query",
+        request,
+        "companion-service",
+    )

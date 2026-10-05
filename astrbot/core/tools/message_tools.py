@@ -207,6 +207,10 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
+        # Cron delivery must be decided from transport state, not from the
+        # agent's natural-language summary. Record invocation before any
+        # validation so malformed tool calls cannot be reported as completed.
+        context.context.event.set_extra("_send_message_to_user_attempted", True)
         # Security: only AstrBot admins can send messages to other sessions.
         # Non-admin users are always restricted to their own session.
         # See https://github.com/AstrBotDevs/AstrBot/issues/7822
@@ -346,6 +350,9 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
             return f"error: failed to find platform for session {target_session}."
         if str(target_session) == current_session:
             context.context.event._has_send_oper = True
+            context.context.event.set_extra(
+                "_send_message_to_user_delivery_succeeded", True
+            )
             sent_plain_text = message_chain.get_plain_text().strip()
             if sent_plain_text:
                 sent_plain_texts = context.context.event.get_extra(

@@ -63,11 +63,13 @@ class _RepoZipUpdater:
         self._httpx_verify = certifi.where() if verify is None else verify
 
     def _create_httpx_client(self, timeout: float = 30.0) -> httpx.AsyncClient:
+        proxy = os.getenv("ASTRBOT_GITHUB_HTTP_PROXY", "").strip() or None
         return httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
-            trust_env=True,
+            trust_env=False,
             verify=self._httpx_verify,
+            proxy=proxy,
         )
 
     @staticmethod

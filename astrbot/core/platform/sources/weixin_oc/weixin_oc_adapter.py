@@ -137,6 +137,9 @@ class WeixinOCAdapter(Platform):
         self.api_timeout_ms = int(
             platform_config.get("weixin_oc_api_timeout_ms", 120_000),
         )
+        self.proxy_url = (
+            str(platform_config.get("weixin_oc_proxy_url", "")).strip() or None
+        )
         self.cdn_base_url = str(
             platform_config.get(
                 "weixin_oc_cdn_base_url",
@@ -196,6 +199,7 @@ class WeixinOCAdapter(Platform):
             cdn_base_url=self.cdn_base_url,
             api_timeout_ms=self.api_timeout_ms,
             token=self.token,
+            proxy_url=self.proxy_url,
         )
 
         if self.token:
@@ -209,6 +213,7 @@ class WeixinOCAdapter(Platform):
         self.client.cdn_base_url = self.cdn_base_url
         self.client.api_timeout_ms = self.api_timeout_ms
         self.client.token = self.token
+        self.client.proxy_url = self.proxy_url
 
     def _get_int_config(
         self,
@@ -605,8 +610,23 @@ class WeixinOCAdapter(Platform):
 
     @staticmethod
     def _normalize_inbound_filename(file_name: str, fallback_name: str) -> str:
-        normalized = Path(file_name or "").name.strip()
-        return normalized or fallback_name
+        value = str(file_name or "").replace("\\", "/")
+        value = "".join(
+            character
+            for character in value
+            if ord(character) >= 32 and ord(character) != 127
+        )
+        normalized = Path(value).name.strip()
+        if normalized in {"", ".", ".."}:
+            normalized = fallback_name
+        return normalized[:160]
+
+    @staticmethod
+    def _normalize_voice_transcript(value: Any) -> str:
+        transcript = " ".join(str(value or "").split())
+        if len(transcript) > 1000:
+            transcript = transcript[:999] + "…"
+        return transcript
 
     def _save_inbound_media(
         self,
@@ -874,15 +894,168 @@ class WeixinOCAdapter(Platform):
         cache_components: list[Any] | None = None,
         cache_message_str: str | None = None,
     ) -> bool:
+        receipt = await self._send_items_with_receipt(
+            user_id,
+            item_list,
+            cache_components=cache_components,
+            cache_message_str=cache_message_str,
+        )
+        return receipt is not None
+
+    async def send_companion_text(
+        self, user_id: str, text: str, client_id: str
+    ) -> str:
+        """Send one Companion-approved text with a deterministic receipt."""
+        if not user_id or not text.strip():
+            raise ValueError("Companion delivery requires a user and text")
+        if len(client_id) != 64 or any(char not in "0123456789abcdef" for char in client_id):
+            raise ValueError("Companion client_id must be 64 lowercase hexadecimal characters")
+        receipt = await self._send_items_with_receipt(
+            user_id,
+            [self._build_plain_text_item(text)],
+            cache_components=[Plain(text)],
+            cache_message_str=text,
+            client_id=client_id,
+        )
+        if receipt is None:
+            raise RuntimeError("WeChat platform did not confirm Companion delivery")
+        return receipt
+
+    async def send_companion_action(
+        self,
+        user_id: str,
+        text: str,
+        reaction: Mapping[str, Any] | None,
+        client_id: str,
+        media: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Send one frozen Companion text/media action with one platform receipt."""
+        if not user_id or not isinstance(text, str):
+            raise ValueError("Companion delivery requires a user and string text")
+        if len(client_id) != 64 or any(char not in "0123456789abcdef" for char in client_id):
+            raise ValueError("Companion client_id must be 64 lowercase hexadecimal characters")
+        item_list: list[dict[str, Any]] = []
+        cache_components: list[Any] = []
+        if text.strip():
+            item_list.append(self._build_plain_text_item(text))
+            cache_components.append(Plain(text))
+        temporary_path: Path | None = None
+        if reaction is not None:
+            if not isinstance(reaction, Mapping) or set(reaction) != {
+                "asset_id", "mime", "base64_data",
+            }:
+                raise ValueError("invalid frozen reaction attachment")
+            mime = reaction["mime"]
+            encoded = reaction["base64_data"]
+            if mime not in {"image/gif", "image/png", "image/jpeg", "image/webp"}:
+                raise ValueError("unsupported reaction image type")
+            if not isinstance(encoded, str) or len(encoded) > 3_000_000:
+                raise ValueError("invalid frozen reaction attachment")
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError("invalid frozen reaction attachment") from exc
+            if not payload or len(payload) > 2_000_000:
+                raise ValueError("invalid frozen reaction attachment")
+            detected = await detect_image_mime_type_async(payload, default_mime_type=None)
+            if detected != mime:
+                raise ValueError("reaction image type does not match its content")
+            suffix = MEDIA_MIME_EXTENSIONS[mime]
+            temporary_path = self._save_inbound_media(
+                payload,
+                prefix="weixin_oc_companion",
+                file_name=f"reaction{suffix}",
+                fallback_suffix=suffix,
+            )
+            try:
+                item_list.append(await self._prepare_media_item(
+                    user_id,
+                    temporary_path,
+                    self.IMAGE_UPLOAD_TYPE,
+                    self.IMAGE_ITEM_TYPE,
+                    temporary_path.name,
+                ))
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        if media is not None:
+            if not isinstance(media, Mapping) or set(media) != {
+                "asset_id", "name", "kind", "mime", "sha256", "base64_data",
+            }:
+                raise ValueError("invalid frozen media attachment")
+            if media["kind"] != "video" or media["mime"] != "video/mp4":
+                raise ValueError("unsupported frozen media type")
+            name, digest, encoded = media["name"], media["sha256"], media["base64_data"]
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or Path(name).name != name
+                or len(name) > 160
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                or not isinstance(encoded, str)
+                or len(encoded) > 12_000_000
+            ):
+                raise ValueError("invalid frozen media attachment")
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError("invalid frozen media attachment") from exc
+            if (
+                not payload
+                or len(payload) > 8_000_000
+                or hashlib.sha256(payload).hexdigest() != digest
+                or len(payload) < 12
+                or payload[4:8] != b"ftyp"
+            ):
+                raise ValueError("invalid frozen media attachment")
+            temporary_path = self._save_inbound_media(
+                payload,
+                prefix="weixin_oc_companion",
+                file_name=name,
+                fallback_suffix=".mp4",
+            )
+            try:
+                item_list.append(await self._prepare_media_item(
+                    user_id,
+                    temporary_path,
+                    self.VIDEO_UPLOAD_TYPE,
+                    self.VIDEO_ITEM_TYPE,
+                    name,
+                ))
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        if not item_list:
+            raise ValueError("Companion action must contain text or media")
+        receipt = await self._send_items_with_receipt(
+            user_id,
+            item_list,
+            cache_components=cache_components,
+            cache_message_str=text.strip() or ("[图片]" if reaction is not None else "[视频]"),
+            client_id=client_id,
+        )
+        if receipt is None:
+            raise RuntimeError("WeChat platform did not confirm Companion delivery")
+        return receipt
+
+    async def _send_items_with_receipt(
+        self,
+        user_id: str,
+        item_list: list[dict[str, Any]],
+        *,
+        cache_components: list[Any] | None = None,
+        cache_message_str: str | None = None,
+        client_id: str | None = None,
+    ) -> str | None:
         if not self.token:
             logger.warning("weixin_oc(%s): missing token, skip send", self.meta().id)
-            return False
+            return None
         if not item_list:
             logger.warning(
                 "weixin_oc(%s): empty message payload is ignored",
                 self.meta().id,
             )
-            return False
+            return None
         context_token = self._context_tokens.get(user_id)
         if not context_token:
             logger.warning(
@@ -890,7 +1063,8 @@ class WeixinOCAdapter(Platform):
                 self.meta().id,
                 user_id,
             )
-            return False
+            return None
+        resolved_client_id = client_id or uuid.uuid4().hex
         payload = await self.client.request_json(
             "POST",
             "ilink/bot/sendmessage",
@@ -901,7 +1075,7 @@ class WeixinOCAdapter(Platform):
                 "msg": {
                     "from_user_id": "",
                     "to_user_id": user_id,
-                    "client_id": uuid.uuid4().hex,
+                    "client_id": resolved_client_id,
                     "message_type": 2,
                     "message_state": 2,
                     "context_token": context_token,
@@ -918,7 +1092,7 @@ class WeixinOCAdapter(Platform):
                 user_id,
                 self._format_api_error(payload),
             )
-            return False
+            return None
         resolved_cache_components = (
             list(cache_components)
             if cache_components is not None
@@ -928,7 +1102,7 @@ class WeixinOCAdapter(Platform):
         sent_at_ms = time.time_ns() // 1_000_000
         self._cache_recent_message(
             user_id,
-            message_id=uuid.uuid4().hex,
+            message_id=resolved_client_id,
             sender_id=sender_id,
             sender_nickname=sender_id,
             timestamp=sent_at_ms // 1000,
@@ -941,7 +1115,7 @@ class WeixinOCAdapter(Platform):
                 include_ref_text=False,
             ),
         )
-        return True
+        return resolved_client_id
 
     def _build_cache_components_from_items(
         self,
@@ -1172,13 +1346,19 @@ class WeixinOCAdapter(Platform):
             elif item_type == 2:
                 text_parts.append("[图片]")
             elif item_type == 3:
-                voice_text = str(item.get("voice_item", {}).get("text", "")).strip()
+                voice_text = self._normalize_voice_transcript(
+                    item.get("voice_item", {}).get("text", "")
+                )
                 if voice_text:
-                    text_parts.append(voice_text)
+                    text_parts.append(f"[语音转写：{voice_text}]")
                 else:
                     text_parts.append("[语音]")
             elif item_type == 4:
-                text_parts.append("[文件]")
+                file_name = self._normalize_inbound_filename(
+                    str(item.get("file_item", {}).get("file_name", "")),
+                    "文件",
+                )
+                text_parts.append(f"[文件：{file_name}]")
             elif item_type == 5:
                 text_parts.append("[视频]")
             else:
