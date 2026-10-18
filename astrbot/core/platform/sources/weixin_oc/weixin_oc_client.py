@@ -23,12 +23,14 @@ class WeixinOCClient:
         cdn_base_url: str,
         api_timeout_ms: int,
         token: str | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self.adapter_id = adapter_id
         self.base_url = base_url
         self.cdn_base_url = cdn_base_url
         self.api_timeout_ms = api_timeout_ms
         self.token = token
+        self.proxy_url = proxy_url.strip() if proxy_url else None
         self._http_session: aiohttp.ClientSession | None = None
 
     async def ensure_http_session(self) -> None:
@@ -151,6 +153,7 @@ class WeixinOCClient:
             data=encrypted,
             headers={"Content-Type": "application/octet-stream"},
             timeout=timeout,
+            proxy=self.proxy_url,
         ) as resp:
             detail = await resp.text()
             logger.debug(
@@ -184,6 +187,7 @@ class WeixinOCClient:
         async with self._http_session.get(
             self._build_cdn_download_url(encrypted_query_param),
             timeout=timeout,
+            proxy=self.proxy_url,
         ) as resp:
             if resp.status >= 400:
                 detail = await resp.text()
@@ -228,6 +232,7 @@ class WeixinOCClient:
             json=payload,
             headers=merged_headers,
             timeout=timeout,
+            proxy=self.proxy_url,
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:

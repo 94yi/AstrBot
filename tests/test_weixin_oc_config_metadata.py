@@ -15,6 +15,7 @@ def test_personal_wechat_only_exposes_user_adjustable_fields():
         "weixin_oc_base_url",
         "weixin_oc_long_poll_timeout_ms",
         "weixin_oc_api_timeout_ms",
+        "weixin_oc_proxy_url",
     }
 
 
